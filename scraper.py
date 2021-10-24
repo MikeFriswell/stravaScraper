@@ -33,8 +33,6 @@ for stat in stats:
     print(stat.text)
 
 print('test')
-#test-comment
-#another-test
 
 for test in test_run:
     print(test.text)

@@ -182,6 +182,72 @@ def streaks(df: pd.DataFrame) -> dict:
     }
 
 
+def weekly_consistency(df: pd.DataFrame, target: int = 3, today: pd.Timestamp | None = None):
+    """Runs per week vs a weekly target (default 3), with a streak summary.
+
+    Consistency is measured by weeks, not days: a week is 'on target' at
+    ``target`` or more runs. Weeks below target still count toward your average
+    (partial credit) — they just don't extend the on-target streak. The current
+    in-progress week is shown but excluded from streak/percentage stats so an
+    unfinished week never looks like a miss.
+    """
+    cols = ["week", "runs", "met", "status", "completed"]
+    if df.empty:
+        return pd.DataFrame(columns=cols), {}
+
+    today = (today or pd.Timestamp.today()).normalize()
+    cur_week = today.to_period("W").start_time
+
+    counts = df.groupby("week").size()
+    weeks = pd.date_range(counts.index.min(), max(counts.index.max(), cur_week), freq="W-MON")
+    counts = counts.reindex(weeks, fill_value=0)
+
+    frame = pd.DataFrame({"week": counts.index, "runs": counts.to_numpy(dtype=int)})
+    frame["completed"] = (today - frame["week"]).dt.days >= 7
+    frame["met"] = frame["runs"] >= target
+
+    def _status(row):
+        if row["week"] == cur_week and not row["completed"]:
+            return "This week"
+        if row["runs"] >= target:
+            return "Target met"
+        return "Partial" if row["runs"] > 0 else "Rest week"
+
+    frame["status"] = frame.apply(_status, axis=1)
+
+    comp = frame[frame["completed"]]
+    met_seq = comp["met"].tolist()
+
+    current = 0
+    for met in reversed(met_seq):
+        if met:
+            current += 1
+        else:
+            break
+    longest = run = 0
+    for met in met_seq:
+        run = run + 1 if met else 0
+        longest = max(longest, run)
+    active = 0
+    for runs in reversed(comp["runs"].tolist()):
+        if runs >= 1:
+            active += 1
+        else:
+            break
+
+    stats = {
+        "target": target,
+        "avg_per_week": float(comp["runs"].mean()) if len(comp) else 0.0,
+        "weeks_total": int(len(comp)),
+        "weeks_met": int(comp["met"].sum()),
+        "pct_met": float(comp["met"].mean() * 100) if len(comp) else 0.0,
+        "current_streak": current,
+        "longest_streak": longest,
+        "active_week_streak": active,
+    }
+    return frame, stats
+
+
 def calendar_matrix(df: pd.DataFrame, year: int, dist_col: str):
     """7×(weeks) matrix of daily distance for a GitHub-style calendar heatmap.
 
@@ -366,6 +432,61 @@ def predict_with_uncertainty(
             "n_efforts": int(len(preds)),
         })
     return pd.DataFrame(rows, columns=cols)
+
+
+# --------------------------------------------------------------------------- #
+# Race planning
+# --------------------------------------------------------------------------- #
+# Target races. predict_key maps to a label in RACE_DISTANCES for predictions.
+RACES = [
+    {
+        "name": "Two Castles 10K",
+        "date": "2026-06-14",
+        "distance_m": 10000.0,
+        "predict_key": "10K",
+        "where": "Warwick Castle → Kenilworth Castle",
+        "notes": "Predominantly flat; main climb leaving Leek Wootton (~halfway). "
+                 "June race — watch the heat.",
+    },
+    {
+        "name": "The Big Half",
+        "date": "2026-09-06",
+        "distance_m": 21097.5,
+        "predict_key": "Half-Marathon",
+        "where": "Tower Bridge → Cutty Sark, Greenwich",
+        "notes": "Fast and flat (~66 m gain).",
+    },
+]
+
+
+def days_until(race_date: str, today: pd.Timestamp | None = None) -> int:
+    today = (today or pd.Timestamp.today()).normalize()
+    return int((pd.Timestamp(race_date).normalize() - today).days)
+
+
+def goal_splits(distance_m: float, goal_seconds: float, unit_m: float):
+    """Even-pace split plan: cumulative target time at each whole km/mile plus
+    the finish. Returns (DataFrame[mark, cum_s], seconds_per_unit)."""
+    total_units = distance_m / unit_m
+    pace_per_unit_s = goal_seconds / total_units
+    rows, k = [], 1
+    while k < total_units - 1e-6:
+        rows.append({"mark": float(k), "cum_s": pace_per_unit_s * k})
+        k += 1
+    rows.append({"mark": round(total_units, 2), "cum_s": float(goal_seconds)})
+    return pd.DataFrame(rows), pace_per_unit_s
+
+
+def weekly_longest_run(df: pd.DataFrame, dist_col: str) -> pd.DataFrame:
+    """Longest single run per week (for endurance build-up tracking)."""
+    if df.empty:
+        return pd.DataFrame(columns=["week", "longest"])
+    out = (
+        df.groupby("week")[dist_col].max()
+        .reset_index().rename(columns={dist_col: "longest"})
+        .sort_values("week")
+    )
+    return out
 
 
 # --------------------------------------------------------------------------- #

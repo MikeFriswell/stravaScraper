@@ -18,6 +18,27 @@ st.set_page_config(page_title="Strava Analysis", page_icon="🏃", layout="wide"
 PLOT_TEMPLATE = "plotly_white"
 
 
+def add_race_markers(fig, x_min=None):
+    """Dashed vertical lines at each race date on a datetime-x chart.
+
+    Plotly's add_vline annotation helper can't average string/Timestamp x's, so
+    we pass the date as epoch-milliseconds (what date axes use internally).
+    Pass ``x_min`` to extend the x-axis out to the races, so future race dates
+    are visible (the empty space is your remaining training runway).
+    """
+    labels = {"10K": "🏰 10K", "Half-Marathon": "🌉 Half"}
+    race_dates = [pd.Timestamp(r["date"]) for r in analysis.RACES]
+    for r, d in zip(analysis.RACES, race_dates):
+        fig.add_vline(
+            x=d.value // 10**6, line_dash="dash", line_color="crimson", opacity=0.6,
+            annotation_text=labels.get(r["predict_key"], r["name"]),
+            annotation_position="top", annotation_font_color="crimson",
+        )
+    if x_min is not None and race_dates:
+        fig.update_xaxes(range=[pd.Timestamp(x_min), max(race_dates) + pd.Timedelta(days=14)])
+    return fig
+
+
 # --------------------------------------------------------------------------- #
 # Data loading
 # --------------------------------------------------------------------------- #
@@ -154,12 +175,128 @@ k3.metric("Moving time", f"{df['moving_hr'].sum():,.0f} h")
 k4.metric(f"Elevation ({ELEV_UNIT})", f"{df[ELEV].sum():,.0f}")
 k5.metric("Relative effort", f"{df['suffer_score'].sum():,.0f}")
 
-(tab_vol, tab_pace, tab_pat, tab_fit, tab_con,
+(tab_race, tab_vol, tab_pace, tab_pat, tab_fit, tab_con,
  tab_pb, tab_map, tab_hr) = st.tabs([
-    "📈 Volume", "⚡ Pace & performance", "🗓️ Patterns",
+    "🎯 Races", "📈 Volume", "⚡ Pace & performance", "🗓️ Patterns",
     "📊 Fitness & form", "🔥 Consistency", "🏆 Records",
     "🗺️ Map", "❤️ HR & effort",
 ])
+
+
+# --------------------------------------------------------------------------- #
+# Races: countdown, predictions, goal pace/splits, endurance, goal-pace zones
+# --------------------------------------------------------------------------- #
+with tab_race:
+    today = pd.Timestamp.today().normalize()
+    unit_m = analysis.M_PER_KM if metric else analysis.M_PER_MILE
+    pace_unit = "min/km" if metric else "min/mi"
+    efforts = load_best_efforts()
+
+    # Predictions from the last 12 months, using your fitted exponent if possible.
+    fit = analysis.fit_fatigue_exponent(efforts, window_days=365)
+    exp = fit[0] if fit else 1.06
+    pred = analysis.predict_with_uncertainty(efforts, window_days=365, exponent=exp)
+    pred_by_key = {row["race"]: row for _, row in pred.iterrows()} if not pred.empty else {}
+
+    goal_paces: dict[str, float] = {}  # race name -> goal pace (sec per unit)
+
+    for r in analysis.RACES:
+        with st.container(border=True):
+            d2g = analysis.days_until(r["date"], today)
+            prow = pred_by_key.get(r["predict_key"])
+
+            st.markdown(f"### {r['name']}")
+            st.caption(f"{r['where']} · {pd.Timestamp(r['date']):%a %d %b %Y} · {r['notes']}")
+
+            top = st.columns(3)
+            top[0].metric("Days to go", f"{d2g}" if d2g >= 0 else "done")
+            if prow is not None:
+                top[1].metric(
+                    "Predicted finish", analysis.format_duration(prow["predicted_s"]),
+                    help=f"±{analysis.format_duration(prow['std_s'])} "
+                         f"({analysis.format_duration(prow['low_s'])}–"
+                         f"{analysis.format_duration(prow['high_s'])})",
+                )
+            else:
+                top[1].metric("Predicted finish", "—")
+
+            default_s = int(prow["predicted_s"]) if prow is not None else 3600
+            g = st.columns([1, 1, 1, 3])
+            gh = g[0].number_input("Goal h", 0, 9, default_s // 3600, key=f"{r['name']}_h")
+            gm = g[1].number_input("min", 0, 59, (default_s % 3600) // 60, key=f"{r['name']}_m")
+            gs = g[2].number_input("sec", 0, 59, default_s % 60, key=f"{r['name']}_s")
+            goal_seconds = gh * 3600 + gm * 60 + gs
+            pace_s = goal_seconds / (r["distance_m"] / unit_m) if goal_seconds else 0
+            goal_paces[r["name"]] = pace_s
+            top[2].metric(f"Goal pace ({pace_unit})", analysis.format_pace(pace_s / 60))
+
+            if goal_seconds:
+                with st.expander("Even-split plan"):
+                    splits, _ = analysis.goal_splits(r["distance_m"], goal_seconds, unit_m)
+                    tbl = pd.DataFrame({
+                        DIST_UNIT: splits["mark"],
+                        "Target clock": splits["cum_s"].apply(analysis.format_duration),
+                    })
+                    st.dataframe(tbl, hide_index=True, width="stretch")
+
+    runs_only = df[df["sport_type"].isin(analysis.RUN_SPORTS)].copy()
+
+    st.subheader("Long-run endurance build (for the half)")
+    wl = analysis.weekly_longest_run(runs_only, DIST)
+    half_units = 21097.5 / unit_m
+    ten_units = 10000.0 / unit_m
+    if wl.empty:
+        st.info("No runs in the current filter.")
+    else:
+        recent = runs_only[runs_only["start_date_local"] >= today - pd.Timedelta(weeks=8)]
+        recent_longest = recent[DIST].max()
+        rl = float(recent_longest) if pd.notna(recent_longest) else 0.0
+        e1, e2, e3 = st.columns(3)
+        e1.metric(f"Longest run, last 8 wks ({DIST_UNIT})", f"{rl:.1f}")
+        e2.metric(f"Gap to half ({DIST_UNIT})", f"{max(half_units - rl, 0):.1f}")
+        e3.metric(f"Half distance ({DIST_UNIT})", f"{half_units:.1f}")
+
+        fig = px.bar(
+            wl, x="week", y="longest", template=PLOT_TEMPLATE,
+            labels={"longest": f"Longest run ({DIST_UNIT})", "week": "Week"},
+            title="Weekly longest run",
+        )
+        fig.add_hline(y=half_units, line_dash="dash", line_color="crimson",
+                      annotation_text="Half", annotation_position="top left")
+        fig.add_hline(y=ten_units, line_dash="dot", line_color="green",
+                      annotation_text="10K", annotation_position="bottom left")
+        add_race_markers(fig, x_min=wl["week"].min())
+        st.plotly_chart(fig, width="stretch")
+        st.caption("Aim to extend your long run toward ~18 km (≈90% of half distance), "
+                   "with the longest 2–3 weeks out, then taper into race day.")
+
+    st.subheader("Goal pace vs your training")
+    recent_runs = runs_only[
+        (runs_only["start_date_local"] >= today - pd.Timedelta(weeks=12))
+        & runs_only[PACE].notna()
+    ]
+    if recent_runs.empty:
+        st.info("No recent runs with pace data to compare.")
+    else:
+        fig = px.histogram(
+            recent_runs, x=PACE, nbins=30, template=PLOT_TEMPLATE,
+            labels={PACE: PACE_LABEL}, title="Your run paces, last 12 weeks",
+        )
+        for r in analysis.RACES:
+            gp = goal_paces.get(r["name"])
+            if gp:
+                fig.add_vline(x=gp / 60, line_dash="dash", line_color="crimson",
+                              annotation_text=f"{r['name']} goal",
+                              annotation_position="top")
+        st.plotly_chart(fig, width="stretch")
+        tc = goal_paces.get("Two Castles 10K")
+        if tc:
+            easy_pct = float((recent_runs[PACE] > tc / 60).mean() * 100)
+            st.caption(
+                f"Relative to your 10K goal pace, **{easy_pct:.0f}%** of recent runs were "
+                f"easier (slower) and **{100 - easy_pct:.0f}%** at/faster than goal. A "
+                "polarised ~80/20 easy/hard split is the usual guideline."
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -370,6 +507,7 @@ with tab_fit:
             labels={"value": "", "date": "Date", "metric": ""},
             title="Fitness, Fatigue & Form",
         )
+        add_race_markers(fig, x_min=tl["date"].min())
         st.plotly_chart(fig, width="stretch")
         st.caption(
             "Positive form = fresh/tapered (good for racing); strongly negative form "
@@ -388,12 +526,38 @@ with tab_fit:
 # Consistency: streaks, calendar heatmap, workload ratio
 # --------------------------------------------------------------------------- #
 with tab_con:
-    s = analysis.streaks(df)
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Longest day streak", f"{s['longest_streak']} d")
-    m2.metric("Current streak", f"{s['current_streak']} d")
-    m3.metric("Active days", f"{s['total_active_days']:,}")
-    m4.metric("Longest break", f"{s['longest_gap']} d")
+    target = int(st.number_input("Runs per week target", min_value=1, max_value=14,
+                                 value=3, step=1))
+    runs_df = df[df["sport_type"].isin(analysis.RUN_SPORTS)]
+    wc, cstats = analysis.weekly_consistency(runs_df, target=target)
+
+    if not cstats:
+        st.info("No runs in the current filter to assess weekly consistency.")
+    else:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Avg runs / week", f"{cstats['avg_per_week']:.1f}")
+        m2.metric("Weeks on target", f"{cstats['weeks_met']}/{cstats['weeks_total']}",
+                  f"{cstats['pct_met']:.0f}%")
+        m3.metric("Current streak", f"{cstats['current_streak']} wks")
+        m4.metric("Longest streak", f"{cstats['longest_streak']} wks")
+        st.caption(
+            f"A week is **on target** at {target}+ runs. Weeks below target still "
+            "count toward your average — they just don't extend the streak. The "
+            "in-progress week is shown but excluded from streak/percentage stats."
+        )
+
+        fig = px.bar(
+            wc, x="week", y="runs", color="status",
+            category_orders={"status": ["Target met", "Partial", "Rest week", "This week"]},
+            color_discrete_map={"Target met": "#2e7d32", "Partial": "#f9a825",
+                                "Rest week": "#e0e0e0", "This week": "#1e88e5"},
+            template=PLOT_TEMPLATE,
+            labels={"runs": "Runs", "week": "Week", "status": ""},
+            title=f"Runs per week (target: {target})",
+        )
+        fig.add_hline(y=target, line_dash="dash", line_color="crimson",
+                      annotation_text="Target", annotation_position="top left")
+        st.plotly_chart(fig, width="stretch")
 
     st.subheader("Calendar heatmap")
     years = sorted(df["year"].unique())
@@ -428,6 +592,7 @@ with tab_con:
     )
     fig.add_hrect(y0=0.8, y1=1.3, fillcolor="green", opacity=0.12, line_width=0)
     fig.add_hline(y=1.5, line_dash="dot", line_color="red")
+    add_race_markers(fig, x_min=acwr["date"].min())
     c2.plotly_chart(fig, width="stretch")
     st.caption(
         "Shaded band (0.8–1.3) is the commonly cited ACWR 'sweet spot'; spikes above "
